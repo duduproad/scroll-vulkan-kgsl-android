@@ -1,0 +1,1366 @@
+#include <ctype.h>
+#include <limits.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <strings.h>
+#include "stringop.h"
+#include "sway/input/input-manager.h"
+#include "sway/input/cursor.h"
+#include "sway/input/seat.h"
+#include "sway/ipc-server.h"
+#include "sway/output.h"
+#include "sway/server.h"
+#include "sway/tree/arrange.h"
+#include "sway/tree/container.h"
+#include "sway/tree/node.h"
+#include "sway/tree/view.h"
+#include "sway/tree/workspace.h"
+#include "sway/desktop/transaction.h"
+#include "sway/desktop/animation.h"
+#include "list.h"
+#include "log.h"
+#include "util.h"
+
+struct workspace_config *workspace_find_config(const char *ws_name) {
+	for (int i = 0; i < config->workspace_configs->length; ++i) {
+		struct workspace_config *wsc = config->workspace_configs->items[i];
+		if (strcmp(wsc->workspace, ws_name) == 0) {
+			return wsc;
+		}
+	}
+	return NULL;
+}
+
+struct sway_output *workspace_get_initial_output(const char *name) {
+	// Check workspace configs for a workspace<->output pair
+	struct workspace_config *wsc = workspace_find_config(name);
+	if (wsc) {
+		for (int i = 0; i < wsc->outputs->length; i++) {
+			struct sway_output *output =
+				output_by_name_or_id(wsc->outputs->items[i]);
+			if (output) {
+				return output;
+			}
+		}
+	}
+	// Otherwise try to put it on the focused output
+	struct sway_seat *seat = input_manager_current_seat();
+	struct sway_node *focus = seat_get_focus_inactive(seat, &root->node);
+	if (focus && focus->type == N_WORKSPACE) {
+		return focus->sway_workspace->output;
+	} else if (focus && focus->type == N_CONTAINER) {
+		return focus->sway_container->pending.workspace->output;
+	}
+	// Fallback to the first output or the headless output
+	return root->outputs->length ? root->outputs->items[0] : root->fallback_output;
+}
+
+struct sway_workspace *workspace_create(struct sway_output *output,
+		const char *name) {
+	sway_assert(name, "NULL name given to workspace_create");
+
+	if (output == NULL) {
+		output = workspace_get_initial_output(name);
+	}
+
+	sway_log(SWAY_DEBUG, "Adding workspace %s for output %s", name,
+			output->wlr_output->name);
+
+	struct sway_workspace *ws = calloc(1, sizeof(struct sway_workspace));
+	if (!ws) {
+		sway_log(SWAY_ERROR, "Unable to allocate sway_workspace");
+		return NULL;
+	}
+	node_init(&ws->node, N_WORKSPACE, ws);
+
+	bool failed = false;
+	ws->layers.tiling = alloc_scene_tree(root->staging, &failed);
+	ws->layers.fullscreen = alloc_scene_tree(root->staging, &failed);
+	ws->jump.tree = alloc_scene_tree(root->staging, &failed);
+
+	if (failed) {
+		sway_scene_node_destroy(&ws->layers.tiling->node);
+		sway_scene_node_destroy(&ws->layers.fullscreen->node);
+		sway_scene_node_destroy(&ws->jump.tree->node);
+		free(ws);
+		return NULL;
+	}
+
+	ws->name = strdup(name);
+	ws->floating = create_list();
+	ws->tiling = create_list();
+	ws->output_priority = create_list();
+
+	ws->gaps_outer = config->gaps_outer;
+	ws->gaps_inner = config->gaps_inner;
+	if (name) {
+		struct workspace_config *wsc = workspace_find_config(name);
+		if (wsc) {
+			if (wsc->gaps_outer.top != INT_MIN) {
+				ws->gaps_outer.top = wsc->gaps_outer.top;
+			}
+			if (wsc->gaps_outer.right != INT_MIN) {
+				ws->gaps_outer.right = wsc->gaps_outer.right;
+			}
+			if (wsc->gaps_outer.bottom != INT_MIN) {
+				ws->gaps_outer.bottom = wsc->gaps_outer.bottom;
+			}
+			if (wsc->gaps_outer.left != INT_MIN) {
+				ws->gaps_outer.left = wsc->gaps_outer.left;
+			}
+			if (wsc->gaps_inner != INT_MIN) {
+				ws->gaps_inner = wsc->gaps_inner;
+			}
+
+			// Add output priorities
+			for (int i = 0; i < wsc->outputs->length; ++i) {
+				char *name = wsc->outputs->items[i];
+				if (strcmp(name, "*") != 0) {
+					list_add(ws->output_priority, strdup(name));
+				}
+			}
+		}
+	}
+
+	// If not already added, add the output to the lowest priority
+	workspace_output_add_priority(ws, output);
+
+	output_add_workspace(output, ws);
+	output_sort_workspaces(output);
+
+	struct wlr_box *area = workspace_get_output_usable_area(ws);
+	ws->width = area->width;
+	ws->height = area->height;
+	ws->x = output->lx + area->x;
+	ws->y = output->ly + area->y;
+	workspace_add_gaps(ws);
+
+	ipc_event_workspace(NULL, ws, "init");
+	wl_signal_emit_mutable(&root->events.new_node, &ws->node);
+
+	layout_init(ws);
+
+	// Lua callbacks
+	for (int i = 0; i < config->lua.cbs_workspace_create->length; ++i) {
+		struct sway_lua_closure *closure = config->lua.cbs_workspace_create->items[i];
+		lua_rawgeti(config->lua.state, LUA_REGISTRYINDEX, closure->cb_function);
+		lua_pushlightuserdata(config->lua.state, ws);
+		lua_rawgeti(config->lua.state, LUA_REGISTRYINDEX, closure->cb_data);
+		lua_call(config->lua.state, 2, 0);
+	}
+
+	return ws;
+}
+
+void workspace_destroy(struct sway_workspace *workspace) {
+	if (!sway_assert(workspace->node.destroying,
+				"Tried to free workspace which wasn't marked as destroying")) {
+		return;
+	}
+	if (!sway_assert(workspace->node.ntxnrefs == 0, "Tried to free workspace "
+				"which is still referenced by transactions")) {
+		return;
+	}
+
+	scene_node_disown_children(workspace->layers.tiling);
+	scene_node_disown_children(workspace->layers.fullscreen);
+	scene_node_disown_children(workspace->jump.tree);
+	sway_scene_node_destroy(&workspace->layers.tiling->node);
+	sway_scene_node_destroy(&workspace->layers.fullscreen->node);
+	sway_scene_node_destroy(&workspace->jump.tree->node);
+
+	free(workspace->name);
+	free(workspace->representation);
+	list_free_items_and_destroy(workspace->output_priority);
+	list_free(workspace->floating);
+	list_free(workspace->tiling);
+	list_free(workspace->current.floating);
+	list_free(workspace->current.tiling);
+	free(workspace);
+}
+
+void workspace_begin_destroy(struct sway_workspace *workspace) {
+	sway_log(SWAY_DEBUG, "Destroying workspace '%s'", workspace->name);
+	ipc_event_workspace(NULL, workspace, "empty"); // intentional
+	wl_signal_emit_mutable(&workspace->node.events.destroy, &workspace->node);
+
+	if (workspace->output) {
+		workspace_detach(workspace);
+	}
+	node_set_dirty(&workspace->node);
+	workspace->node.destroying = true;
+}
+
+void workspace_consider_destroy(struct sway_workspace *ws) {
+	if (ws->tiling->length || ws->floating->length) {
+		return;
+	}
+
+	if (ws->output && output_get_active_workspace(ws->output) == ws) {
+		return;
+	}
+
+	struct sway_workspace *sibling = NULL;
+	if (ws->split.split != WORKSPACE_SPLIT_NONE) {
+		sibling = ws->split.sibling;
+		if (sibling->tiling->length || sibling->floating->length) {
+			return;
+		}
+		if (sibling->output && output_get_active_workspace(sibling->output) == sibling) {
+			return;
+		}
+	}
+
+	struct sway_seat *seat;
+	wl_list_for_each(seat, &server.input->seats, link) {
+		struct sway_node *node = seat_get_focus_inactive(seat, &root->node);
+		if (node == &ws->node) {
+			return;
+		}
+		if (sibling && node == &sibling->node) {
+			return;
+		}
+	}
+
+	workspace_begin_destroy(ws);
+	if (sibling) {
+		workspace_begin_destroy(sibling);
+	}
+}
+
+static bool workspace_valid_on_output(const char *output_name,
+		const char *ws_name) {
+	struct workspace_config *wsc = workspace_find_config(ws_name);
+	struct sway_output *output = output_by_name_or_id(output_name);
+	if (!output) {
+		return false;
+	}
+	if (!wsc) {
+		return true;
+	}
+
+	for (int i = 0; i < wsc->outputs->length; i++) {
+		struct sway_output *ws_output =
+			output_by_name_or_id(wsc->outputs->items[i]);
+		if (ws_output) {
+			return ws_output == output;
+		}
+	}
+
+	return false;
+}
+
+static void workspace_name_from_binding(const struct sway_binding * binding,
+		const char* output_name, int *min_order, char **earliest_name) {
+	char *cmdlist = strdup(binding->command);
+	char *dup = cmdlist;
+	char *name = NULL;
+
+	// workspace n
+	char *cmd = argsep(&cmdlist, " ", NULL);
+	if (cmdlist) {
+		name = argsep(&cmdlist, ",;", NULL);
+	}
+
+	// TODO: support "move container to workspace" bindings as well
+
+	if (strcmp("workspace", cmd) == 0 && name) {
+		char *_target = strdup(name);
+		_target = do_var_replacement(_target);
+		strip_quotes(_target);
+		sway_log(SWAY_DEBUG, "Got valid workspace command for target: '%s'",
+				_target);
+
+		// Make sure that the command references an actual workspace
+		// not a command about workspaces
+		if (strcmp(_target, "next") == 0 ||
+				strcmp(_target, "prev") == 0 ||
+				strcmp(_target, "next_on_output") == 0 ||
+				strcmp(_target, "prev_on_output") == 0 ||
+				strcmp(_target, "number") == 0 ||
+				strcmp(_target, "back_and_forth") == 0 ||
+				strcmp(_target, "current") == 0) {
+			free(_target);
+			free(dup);
+			return;
+		}
+
+		// If the command is workspace number <name>, isolate the name
+		if (has_prefix(_target, "number ")) {
+			size_t length = strlen(_target) - strlen("number ") + 1;
+			char *temp = malloc(length);
+			strncpy(temp, _target + strlen("number "), length - 1);
+			temp[length - 1] = '\0';
+			free(_target);
+			_target = temp;
+			sway_log(SWAY_DEBUG, "Isolated name from workspace number: '%s'", _target);
+
+			// Make sure the workspace number doesn't already exist
+			if (isdigit(_target[0]) && workspace_by_number(_target)) {
+				free(_target);
+				free(dup);
+				return;
+			}
+		}
+
+		// Make sure that the workspace doesn't already exist
+		if (workspace_by_name(_target)) {
+			free(_target);
+			free(dup);
+			return;
+		}
+
+		// make sure that the workspace can appear on the given
+		// output
+		if (!workspace_valid_on_output(output_name, _target)) {
+			free(_target);
+			free(dup);
+			return;
+		}
+
+		if (binding->order < *min_order) {
+			*min_order = binding->order;
+			free(*earliest_name);
+			*earliest_name = _target;
+			sway_log(SWAY_DEBUG, "Workspace: Found free name %s", _target);
+		} else {
+			free(_target);
+		}
+	}
+	free(dup);
+}
+
+char *workspace_next_name(const char *output_name) {
+	sway_log(SWAY_DEBUG, "Workspace: Generating new workspace name for output %s",
+			output_name);
+	// Scan for available workspace names by looking through output-workspace
+	// assignments primarily, falling back to bindings and numbers.
+	struct sway_mode *mode = config->current_mode;
+
+	struct sway_output *output = output_by_name_or_id(output_name);
+	if (!output) {
+		return NULL;
+	}
+
+	int order = INT_MAX;
+	char *target = NULL;
+	for (int i = 0; i < mode->keysym_bindings->length; ++i) {
+		workspace_name_from_binding(mode->keysym_bindings->items[i],
+				output_name, &order, &target);
+	}
+	for (int i = 0; i < mode->keycode_bindings->length; ++i) {
+		workspace_name_from_binding(mode->keycode_bindings->items[i],
+				output_name, &order, &target);
+	}
+	for (int i = 0; i < config->workspace_configs->length; ++i) {
+		// Unlike with bindings, this does not guarantee order
+		const struct workspace_config *wsc = config->workspace_configs->items[i];
+		if (workspace_by_name(wsc->workspace)) {
+			continue;
+		}
+		bool found = false;
+		for (int j = 0; j < wsc->outputs->length; ++j) {
+			struct sway_output *ws_output =
+				output_by_name_or_id(wsc->outputs->items[j]);
+			if (ws_output) {
+				if (ws_output == output) {
+					found = true;
+					free(target);
+					target = strdup(wsc->workspace);
+				}
+				break;
+			}
+		}
+		if (found) {
+			break;
+		}
+	}
+	if (target != NULL) {
+		return target;
+	}
+	// As a fall back, use the next available number
+	char name[12] = "";
+	unsigned int ws_num = 1;
+	do {
+		snprintf(name, sizeof(name), "%u", ws_num++);
+	} while (workspace_by_number(name));
+	return strdup(name);
+}
+
+static bool _workspace_by_number(struct sway_workspace *ws, void *data) {
+	char *name = data;
+	char *ws_name = ws->name;
+	while (isdigit(*name)) {
+		if (*name++ != *ws_name++) {
+			return false;
+		}
+	}
+	return !isdigit(*ws_name);
+}
+
+struct sway_workspace *workspace_by_number(const char* name) {
+	return root_find_workspace(_workspace_by_number, (void *) name);
+}
+
+static bool _workspace_by_name(struct sway_workspace *ws, void *data) {
+	return strcasecmp(ws->name, data) == 0;
+}
+
+struct sway_workspace *workspace_by_name(const char *name) {
+	struct sway_seat *seat = input_manager_current_seat();
+	struct sway_workspace *current = seat_get_focused_workspace(seat);
+
+	if (current && strcmp(name, "prev") == 0) {
+		return workspace_prev(current);
+	} else if (current && strcmp(name, "prev_on_output") == 0) {
+		return workspace_output_prev(current);
+	} else if (current && strcmp(name, "next") == 0) {
+		return workspace_next(current);
+	} else if (current && strcmp(name, "next_on_output") == 0) {
+		return workspace_output_next(current);
+	} else if (strcmp(name, "current") == 0) {
+		return current;
+	} else if (strcasecmp(name, "back_and_forth") == 0) {
+		struct sway_seat *seat = input_manager_current_seat();
+		if (!seat->prev_workspace_name) {
+			return NULL;
+		}
+		return root_find_workspace(_workspace_by_name,
+				(void*)seat->prev_workspace_name);
+	} else {
+		return root_find_workspace(_workspace_by_name, (void*)name);
+	}
+}
+
+static int workspace_get_number(struct sway_workspace *workspace) {
+	char *endptr = NULL;
+	errno = 0;
+	long long n = strtoll(workspace->name, &endptr, 10);
+	if (errno != 0 || n > INT32_MAX || n < 0 || endptr == workspace->name) {
+		n = -1;
+	}
+	return n;
+}
+
+struct sway_workspace *workspace_prev(struct sway_workspace *workspace) {
+	int n = workspace_get_number(workspace);
+	struct sway_workspace *prev = NULL, *last = NULL, *other = NULL;
+	bool found = false;
+	if (n < 0) {
+		// Find the prev named workspace
+		int othern = -1;
+		for (int i = root->outputs->length - 1; i >= 0; i--) {
+			struct sway_output *output = root->outputs->items[i];
+			for (int j = output->workspaces->length - 1; j >= 0; j--) {
+				struct sway_workspace *ws = output->workspaces->items[j];
+				int wsn = workspace_get_number(ws);
+				if (!last) {
+					// The first workspace in reverse order
+					last = ws;
+				}
+				if (!other || (wsn >= 0 && wsn > othern)) {
+					// The last (greatest) numbered workspace.
+					other = ws;
+					othern = workspace_get_number(other);
+				}
+				if (ws == workspace) {
+					found = true;
+				} else if (wsn < 0 && found) {
+					// Found a non-numbered workspace before current
+					return ws;
+				}
+			}
+		}
+	} else {
+		// Find the prev numbered workspace
+		int prevn = -1, lastn = -1;
+		for (int i = root->outputs->length - 1; i >= 0; i--) {
+			struct sway_output *output = root->outputs->items[i];
+			for (int j = output->workspaces->length - 1; j >= 0; j--) {
+				struct sway_workspace *ws = output->workspaces->items[j];
+				int wsn = workspace_get_number(ws);
+				if (!last || (wsn >= 0 && wsn > lastn)) {
+					// The greatest numbered (or last) workspace
+					last = ws;
+					lastn = workspace_get_number(last);
+				}
+				if (!other && wsn < 0) {
+					// The last named workspace
+					other = ws;
+				}
+				if (wsn < 0) {
+					// Haven't reached the numbered workspaces
+					continue;
+				}
+				if (wsn < n && (!prev || wsn > prevn)) {
+					// The closest workspace before the current
+					prev = ws;
+					prevn = workspace_get_number(prev);
+				}
+			}
+		}
+	}
+
+	if (!prev) {
+		prev = other ? other : last;
+	}
+	return prev;
+}
+
+struct sway_workspace *workspace_next(struct sway_workspace *workspace) {
+	int n = workspace_get_number(workspace);
+	struct sway_workspace *next = NULL, *first = NULL, *other = NULL;
+	bool found = false;
+	if (n < 0) {
+		// Find the next named workspace
+		int othern = -1;
+		for (int i = 0; i < root->outputs->length; i++) {
+			struct sway_output *output = root->outputs->items[i];
+			for (int j = 0; j < output->workspaces->length; j++) {
+				struct sway_workspace *ws = output->workspaces->items[j];
+				int wsn = workspace_get_number(ws);
+				if (!first) {
+					// The first named workspace
+					first = ws;
+				}
+				if (!other || (wsn >= 0 && wsn < othern)) {
+					// The first (least) numbered workspace
+					other = ws;
+					othern = workspace_get_number(other);
+				}
+				if (ws == workspace) {
+					found = true;
+				} else if (wsn < 0 && found) {
+					// The first non-numbered workspace after the current
+					return ws;
+				}
+			}
+		}
+	} else {
+		// Find the next numbered workspace
+		int nextn = -1, firstn = -1;
+		for (int i = 0; i < root->outputs->length; i++) {
+			struct sway_output *output = root->outputs->items[i];
+			for (int j = 0; j < output->workspaces->length; j++) {
+				struct sway_workspace *ws = output->workspaces->items[j];
+				int wsn = workspace_get_number(ws);
+				if (!first || (wsn >= 0 && wsn < firstn)) {
+					// The first (or least numbered) workspace
+					first = ws;
+					firstn = workspace_get_number(first);
+				}
+				if (!other && wsn < 0) {
+					// The first non-numbered workspace
+					other = ws;
+				}
+				if (wsn < 0) {
+					// Checked all the numbered workspaces
+					break;
+				}
+				if (n < wsn && (!next || wsn < nextn)) {
+					// The first workspace numerically after the current
+					next = ws;
+					nextn = workspace_get_number(next);
+				}
+			}
+		}
+	}
+
+	if (!next) {
+		// If there is no next workspace from the same category, return the
+		// first from this category.
+		next = other ? other : first;
+	}
+	return next;
+}
+
+/**
+ * Get the previous or next workspace on the specified output. Wraps around at
+ * the end and beginning.  If next is false, the previous workspace is returned,
+ * otherwise the next one is returned.
+ */
+static struct sway_workspace *workspace_output_prev_next_impl(
+		struct sway_output *output, int dir) {
+	struct sway_seat *seat = input_manager_current_seat();
+	struct sway_workspace *workspace = seat_get_focused_workspace(seat);
+	if (!workspace) {
+		sway_log(SWAY_DEBUG,
+				"No focused workspace to base prev/next on output off of");
+		return NULL;
+	}
+
+	int index = list_find(output->workspaces, workspace);
+	if (config->workspace_next_on_output_create_empty) {
+		if (index + dir >= output->workspaces->length) {
+			char *ws_name = workspace_next_name(output->wlr_output->name);
+			struct sway_workspace *ws = workspace_create(output, ws_name);
+			free(ws_name);
+			return ws;
+		}
+	}
+	size_t new_index = wrap(index + dir, output->workspaces->length);
+	return output->workspaces->items[new_index];
+}
+
+
+struct sway_workspace *workspace_output_next(struct sway_workspace *current) {
+	return workspace_output_prev_next_impl(current->output, 1);
+}
+
+struct sway_workspace *workspace_output_prev(struct sway_workspace *current) {
+	return workspace_output_prev_next_impl(current->output, -1);
+}
+
+struct sway_workspace *workspace_auto_back_and_forth(
+		struct sway_workspace *workspace) {
+	struct sway_seat *seat = input_manager_current_seat();
+	struct sway_workspace *active_ws = NULL;
+	struct sway_node *focus = seat_get_focus_inactive(seat, &root->node);
+	if (focus && focus->type == N_WORKSPACE) {
+		active_ws = focus->sway_workspace;
+	} else if (focus && focus->type == N_CONTAINER) {
+		active_ws = focus->sway_container->pending.workspace;
+	}
+
+	if (config->auto_back_and_forth && active_ws && active_ws == workspace &&
+			seat->prev_workspace_name) {
+		struct sway_workspace *new_ws =
+			workspace_by_name(seat->prev_workspace_name);
+		workspace = new_ws ?
+			new_ws :
+			workspace_create(NULL, seat->prev_workspace_name);
+	}
+	return workspace;
+}
+
+struct workspace_switch_container_data {
+	struct sway_container *container;
+	double y;
+};
+
+struct workspace_switch_data {
+	struct sway_workspace *from;
+	struct sway_workspace *to;
+	list_t *from_containers;
+	list_t *to_containers;
+};
+
+static void workspace_switch_callback_end(void *callback_data) {
+	struct workspace_switch_data *data = callback_data;
+
+	for (int i = 0; i < data->from_containers->length; ++i) {
+		struct workspace_switch_container_data *cdata = data->from_containers->items[i];
+		cdata->container->pending.y = cdata->y;
+		node_set_dirty(&cdata->container->node);
+	}
+	for (int i = 0; i < data->to_containers->length; ++i) {
+		struct workspace_switch_container_data *cdata = data->to_containers->items[i];
+		cdata->container->current.y = cdata->y;
+		node_set_dirty(&cdata->container->node);
+	}
+
+	if (data->from->output) {
+		node_set_dirty(&data->from->node);
+	}
+	if (data->to->output) {
+		node_set_dirty(&data->to->node);
+	}
+
+	list_free_items_and_destroy(data->from_containers);
+	list_free_items_and_destroy(data->to_containers);
+	free(data);
+	root_set_default_filters(root);
+
+	transaction_commit_dirty();
+}
+
+static bool switching_output(struct sway_workspace *workspace,
+		struct workspace_switch_data *data) {
+	if (!data) {
+		return false;
+	}
+	struct sway_output *output = workspace->output;
+	struct sway_output *from_output = data->from->output;
+	struct sway_output *to_output = data->to->output;
+	if (!output || !from_output || !to_output) {
+		return false;
+	}
+	if (output == from_output || output == to_output) {
+		return true;
+	}
+	return false;
+}
+
+static bool workspace_switch_animation_filter(struct sway_workspace *workspace, void *filter_data) {
+	return switching_output(workspace, filter_data);
+}
+
+static bool workspace_switch_workspace_filter(struct sway_workspace *workspace, void *filter_data) {
+	if (switching_output(workspace, filter_data)) {
+		struct workspace_switch_data *data = filter_data;
+		return workspace == data->from || workspace == data->to;
+	}
+	if (!layout_overview_workspaces_enabled()) {
+		struct sway_output *output = workspace->output;
+		struct sway_workspace *active = output->current.active_workspace;
+		if (workspace != active) {
+			if (workspace->split.split != WORKSPACE_SPLIT_NONE &&
+				workspace->split.sibling == active) {
+				return true;
+			}
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool workspace_switch_container_filter(struct sway_workspace *workspace,
+		struct sway_container *container, void *filter_data) {
+	if (!switching_output(workspace, filter_data)) {
+		return true;
+	}
+	struct workspace_switch_data *data = filter_data;
+	for (int i = 0; i < data->from_containers->length; ++i) {
+		struct workspace_switch_container_data *container_data = data->from_containers->items[i];
+		if (container == container_data->container) {
+			return true;
+		}
+	}
+	for (int i = 0; i < data->to_containers->length; ++i) {
+		struct workspace_switch_container_data *container_data = data->to_containers->items[i];
+		if (container == container_data->container) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool container_visible(struct sway_workspace *workspace,
+		struct sway_container *container) {
+	float scale = layout_scale_enabled(workspace) ? layout_scale_get(workspace) : 1.0f;
+	struct sway_output *output = workspace->output;
+	if (container->pending.x >= output->lx + output->width ||
+		container->pending.x + scale * container->pending.width <= output->lx ||
+		container->pending.y >= output->ly + output->height ||
+		container->pending.y + scale * container->pending.height <= output->ly) {
+		return false;
+	}
+	return true;
+}
+
+typedef void (*add_delta_to_container_func_t)(struct sway_container *con, double delta);
+
+static void add_delta_to_current(struct sway_container *con, double delta) {
+	con->current.y += delta;
+}
+
+static void add_delta_to_pending(struct sway_container *con, double delta) {
+	con->pending.y += delta;
+}
+
+static void select_visible_containers(list_t *containers,
+		struct sway_workspace *workspace, list_t *children,
+		double *min_y, double *max_y) {
+	if (!workspace->output || children->length == 0) {
+		*min_y = workspace->y;
+		*max_y = workspace->y + workspace->height;
+		return;
+	}
+	for (int i = 0; i < children->length; ++i) {
+		struct sway_container *con = children->items[i];
+		if (container_visible(workspace, con)) {
+			struct workspace_switch_container_data *container_data =
+				malloc(sizeof(struct workspace_switch_container_data));
+			container_data->container = con;
+			container_data->y = con->current.y;
+			list_add(containers, container_data);
+			if (con->pending.children) {
+				select_visible_containers(containers, workspace,
+					con->pending.children, min_y, max_y);
+			}
+			node_set_dirty(&con->node);
+			if (con->pending.parent) {
+				float scale = layout_scale_enabled(workspace) ? layout_scale_get(workspace) : 1.0f;
+				int gap = workspace->gaps_inner;
+				const double miny = con->pending.y - gap;
+				const double maxy = con->pending.y + scale * (con->pending.height + gap);
+				if (miny < *min_y) {
+					*min_y = miny;
+				}
+				if (maxy > *max_y) {
+					*max_y = maxy;
+				}
+			}
+		}
+	}
+}
+
+static void add_delta_to_containers(list_t *containers,
+		add_delta_to_container_func_t add_delta, double delta) {
+	for (int i = 0; i < containers->length; ++i) {
+		struct workspace_switch_container_data *data = containers->items[i];
+		add_delta(data->container, delta);
+	}
+}
+
+static bool workspace_switch_down(struct sway_workspace *from, struct sway_workspace *to) {
+	int f_idx = workspace_get_number(from);
+	int t_idx = workspace_get_number(to);
+	if (f_idx < 0 || t_idx < 0) {
+		const char *f_name = from->name;
+		const char *t_name = to->name;
+		while (f_name && t_name) {
+			if (*f_name == *t_name) {
+				++f_name;
+				++t_name;
+			} else {
+				return *f_name < *t_name;
+			}
+		}
+		return *f_name < *t_name;
+	} else {
+		return f_idx < t_idx;
+	}
+}
+
+static void animate_workspace_switch(struct sway_output *output,
+		struct sway_workspace *from, struct sway_workspace *to) {
+	bool down = workspace_switch_down(from, to);
+	animation_end();
+	animation_set_type(ANIMATION_WORKSPACE_SWITCH);
+	struct workspace_switch_data *data = malloc(sizeof(struct workspace_switch_data));
+	data->from = from;
+	data->to = to;
+	data->from_containers = create_list();
+	data->to_containers = create_list();
+	root->filters.free_animation_activation_filter = workspace_switch_animation_filter;
+	root->filters.free_animation_activation_filter_data = data;
+	root->filters.workspace_filter = workspace_switch_workspace_filter;
+	root->filters.workspace_filter_data = data;
+	root->filters.container_filter = workspace_switch_container_filter;
+	root->filters.container_filter_data = data;
+
+	double min_y_to = DBL_MAX, max_y_to = -DBL_MAX;
+	select_visible_containers(data->to_containers, to, to->tiling, &min_y_to, &max_y_to);
+	if (max_y_to < min_y_to) {
+		max_y_to = min_y_to = to->y;
+	}
+	double min_y_from = DBL_MAX, max_y_from = -DBL_MAX;
+	select_visible_containers(data->from_containers, from, from->tiling, &min_y_from, &max_y_from);
+	if (max_y_from < min_y_from) {
+		max_y_from = min_y_from = from->y;
+	}
+	double delta;
+	if (down) {
+		delta = output->height + max_y_from - (from->y + from->height)
+			+ (from->y - min_y_to);
+	} else {
+		delta = output->height + max_y_to - (from->y + from->height)
+			+ (from->y - min_y_from);
+		delta = -delta;
+	}
+	add_delta_to_containers(data->to_containers, add_delta_to_current, delta);
+	add_delta_to_containers(data->from_containers, add_delta_to_pending, -delta);
+
+	struct sway_animation_callbacks *callbacks = animation_get_callbacks();
+	callbacks->callback_end = workspace_switch_callback_end;
+	callbacks->callback_end_data = data;
+	animation_set_callbacks(callbacks);
+}
+
+bool workspace_switch(struct sway_workspace *workspace) {
+	struct sway_seat *seat = input_manager_current_seat();
+
+	sway_log(SWAY_DEBUG, "Switching to workspace %p:%s",
+		workspace, workspace->name);
+	struct sway_workspace *old_ws = seat_get_focused_workspace(seat);
+
+	struct sway_node *next = seat_get_focus_inactive(seat, &workspace->node);
+	if (next == NULL) {
+		next = &workspace->node;
+	}
+	seat_set_focus(seat, next);
+
+	// old_ws may not have an output because it is being destroyed if empty
+	if (old_ws != workspace && (
+		(old_ws->output && old_ws->output == workspace->output) ||
+		(old_ws->output && !workspace->output) ||
+		(!old_ws->output && workspace->output)) &&
+		workspace->split.sibling != old_ws &&
+		animation_enabled() && animation_path_enabled(ANIMATION_WORKSPACE_SWITCH)) {
+		struct sway_output *output = old_ws->output ? old_ws->output : workspace->output;
+		animate_workspace_switch(output, old_ws, workspace);
+	} else {
+		arrange_workspace(workspace);
+	}
+	return true;
+}
+
+bool workspace_is_visible(struct sway_workspace *ws) {
+	if (ws->node.destroying) {
+		return false;
+	}
+	struct sway_workspace *workspace = output_get_active_workspace(ws->output);
+	if (workspace == ws) {
+		return true;
+	}
+	if (workspace &&
+		workspace->split.split != WORKSPACE_SPLIT_NONE &&
+		workspace->split.sibling == ws) {
+		return true;
+	}
+	return false;
+}
+
+bool workspace_is_empty(struct sway_workspace *ws) {
+	if (ws->tiling->length) {
+		return false;
+	}
+	// Sticky views are not considered to be part of this workspace
+	for (int i = 0; i < ws->floating->length; ++i) {
+		struct sway_container *floater = ws->floating->items[i];
+		if (!container_is_sticky(floater)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static int find_output(const void *id1, const void *id2) {
+	return strcmp(id1, id2);
+}
+
+static int workspace_output_get_priority(struct sway_workspace *ws,
+		struct sway_output *output) {
+	char identifier[128];
+	output_get_identifier(identifier, sizeof(identifier), output);
+	int index_id = list_seq_find(ws->output_priority, find_output, identifier);
+	int index_name = list_seq_find(ws->output_priority, find_output,
+			output->wlr_output->name);
+	return index_name < 0 || index_id < index_name ? index_id : index_name;
+}
+
+void workspace_output_raise_priority(struct sway_workspace *ws,
+		struct sway_output *old_output, struct sway_output *output) {
+	int old_index = workspace_output_get_priority(ws, old_output);
+	if (old_index < 0) {
+		return;
+	}
+
+	int new_index = workspace_output_get_priority(ws, output);
+	if (new_index < 0) {
+		char identifier[128];
+		output_get_identifier(identifier, sizeof(identifier), output);
+		list_insert(ws->output_priority, old_index, strdup(identifier));
+	} else if (new_index > old_index) {
+		char *name = ws->output_priority->items[new_index];
+		list_del(ws->output_priority, new_index);
+		list_insert(ws->output_priority, old_index, name);
+	}
+}
+
+void workspace_output_add_priority(struct sway_workspace *workspace,
+		struct sway_output *output) {
+	if (workspace_output_get_priority(workspace, output) < 0) {
+		char identifier[128];
+		output_get_identifier(identifier, sizeof(identifier), output);
+		list_add(workspace->output_priority, strdup(identifier));
+	}
+}
+
+struct sway_output *workspace_output_get_highest_available(
+		struct sway_workspace *ws) {
+	for (int i = 0; i < ws->output_priority->length; i++) {
+		const char *name = ws->output_priority->items[i];
+		struct sway_output *output = output_by_name_or_id(name);
+		if (output) {
+			return output;
+		}
+	}
+
+	return NULL;
+}
+
+static bool find_urgent_iterator(struct sway_container *con, void *data) {
+	return con->view && view_is_urgent(con->view);
+}
+
+void workspace_detect_urgent(struct sway_workspace *workspace) {
+	bool new_urgent = (bool)workspace_find_container(workspace,
+			find_urgent_iterator, NULL);
+
+	if (workspace->urgent != new_urgent) {
+		workspace->urgent = new_urgent;
+		ipc_event_workspace(NULL, workspace, "urgent");
+	}
+}
+
+void workspace_for_each_container(struct sway_workspace *ws,
+		void (*f)(struct sway_container *con, void *data), void *data) {
+	// Tiling
+	for (int i = 0; i < ws->tiling->length; ++i) {
+		struct sway_container *container = ws->tiling->items[i];
+		f(container, data);
+		container_for_each_child(container, f, data);
+	}
+	// Floating
+	for (int i = 0; i < ws->floating->length; ++i) {
+		struct sway_container *container = ws->floating->items[i];
+		f(container, data);
+		container_for_each_child(container, f, data);
+	}
+}
+
+struct sway_container *workspace_find_container(struct sway_workspace *ws,
+		bool (*test)(struct sway_container *con, void *data), void *data) {
+	struct sway_container *result = NULL;
+    if (ws == NULL){
+        sway_log(SWAY_ERROR, "Cannot find container with no workspace.");
+        return NULL;
+    }
+
+	// Tiling
+	for (int i = 0; i < ws->tiling->length; ++i) {
+		struct sway_container *child = ws->tiling->items[i];
+		if (test(child, data)) {
+			return child;
+		}
+		if ((result = container_find_child(child, test, data))) {
+			return result;
+		}
+	}
+	// Floating
+	for (int i = 0; i < ws->floating->length; ++i) {
+		struct sway_container *child = ws->floating->items[i];
+		if (test(child, data)) {
+			return child;
+		}
+		if ((result = container_find_child(child, test, data))) {
+			return result;
+		}
+	}
+	return NULL;
+}
+
+static void set_workspace(struct sway_container *container, void *data) {
+	container->pending.workspace = container->pending.parent->pending.workspace;
+}
+
+void workspace_detach(struct sway_workspace *workspace) {
+	struct sway_output *output = workspace->output;
+	int index = list_find(output->workspaces, workspace);
+	if (index != -1) {
+		list_del(output->workspaces, index);
+	}
+	workspace->output = NULL;
+
+	node_set_dirty(&workspace->node);
+	node_set_dirty(&output->node);
+}
+
+struct sway_container *workspace_add_tiling(struct sway_workspace *workspace,
+		struct sway_container *con) {
+	if (con->pending.workspace) {
+		struct sway_container *old_parent = con->pending.parent;
+		container_detach(con);
+		if (old_parent) {
+			container_reap_empty(old_parent);
+		}
+	}
+	if (config->default_layout != L_NONE) {
+		con = container_split(con, config->default_layout);
+	}
+	list_add(workspace->tiling, con);
+	con->pending.workspace = workspace;
+	container_for_each_child(con, set_workspace, NULL);
+	container_handle_fullscreen_reparent(con);
+	workspace_update_representation(workspace);
+	node_set_dirty(&workspace->node);
+	node_set_dirty(&con->node);
+	return con;
+}
+
+void workspace_add_floating(struct sway_workspace *workspace,
+		struct sway_container *con) {
+	if (con->pending.workspace) {
+		container_detach(con);
+	}
+	if (layout_scale_enabled(workspace)) {
+		layout_view_scale_set(con, layout_scale_get(workspace));
+	} else {
+		layout_view_scale_reset(con);
+	}
+	list_add(workspace->floating, con);
+	con->pending.workspace = workspace;
+	container_for_each_child(con, set_workspace, NULL);
+	container_handle_fullscreen_reparent(con);
+	node_set_dirty(&workspace->node);
+	node_set_dirty(&con->node);
+}
+
+void workspace_insert_tiling_direct(struct sway_workspace *workspace,
+		struct sway_container *con, int index) {
+	list_insert(workspace->tiling, index, con);
+	con->pending.workspace = workspace;
+	container_for_each_child(con, set_workspace, NULL);
+	container_handle_fullscreen_reparent(con);
+	workspace_update_representation(workspace);
+	node_set_dirty(&workspace->node);
+	node_set_dirty(&con->node);
+}
+
+struct sway_container *workspace_insert_tiling(struct sway_workspace *workspace,
+		struct sway_container *con, int index) {
+	if (con->pending.workspace) {
+		container_detach(con);
+	}
+	if (config->default_layout != L_NONE) {
+		con = container_split(con, config->default_layout);
+	}
+	workspace_insert_tiling_direct(workspace, con, index);
+	return con;
+}
+
+bool workspace_has_single_visible_container(struct sway_workspace *ws) {
+	struct sway_seat *seat = input_manager_get_default_seat();
+	struct sway_container *focus =
+		seat_get_focus_inactive_tiling(seat, ws);
+	if (focus && !focus->view) {
+		focus = seat_get_focus_inactive_view(seat, &focus->node);
+	}
+	return (focus && focus->view && view_ancestor_is_only_visible(focus->view));
+}
+
+void workspace_add_gaps(struct sway_workspace *ws) {
+	if (config->smart_gaps == SMART_GAPS_ON
+			&& workspace_has_single_visible_container(ws)) {
+		ws->current_gaps.top = 0;
+		ws->current_gaps.right = 0;
+		ws->current_gaps.bottom = 0;
+		ws->current_gaps.left = 0;
+		return;
+	}
+
+	if (config->smart_gaps == SMART_GAPS_INVERSE_OUTER
+			&& !workspace_has_single_visible_container(ws)) {
+		ws->current_gaps.top = 0;
+		ws->current_gaps.right = 0;
+		ws->current_gaps.bottom = 0;
+		ws->current_gaps.left = 0;
+	} else {
+		ws->current_gaps = ws->gaps_outer;
+	}
+
+	// Add inner gaps and make sure we don't turn out negative
+	// For scroll, we don't add the inner gaps, they are added in the offset
+	ws->current_gaps.top = fmax(0, ws->current_gaps.top);
+	ws->current_gaps.right = fmax(0, ws->current_gaps.right);
+	ws->current_gaps.bottom = fmax(0, ws->current_gaps.bottom);
+	ws->current_gaps.left = fmax(0, ws->current_gaps.left);
+
+	// Now that we have the total gaps calculated we may need to clamp them in
+	// case they've made the available area too small
+	if (ws->width - ws->current_gaps.left - ws->current_gaps.right < MIN_SANE_W
+			&& ws->current_gaps.left + ws->current_gaps.right > 0) {
+		int total_gap = fmax(0, ws->width - MIN_SANE_W);
+		double left_gap_frac = ((double)ws->current_gaps.left /
+			((double)ws->current_gaps.left + (double)ws->current_gaps.right));
+		ws->current_gaps.left = left_gap_frac * total_gap;
+		ws->current_gaps.right = total_gap - ws->current_gaps.left;
+	}
+	if (ws->height - ws->current_gaps.top - ws->current_gaps.bottom < MIN_SANE_H
+			&& ws->current_gaps.top + ws->current_gaps.bottom > 0) {
+		int total_gap = fmax(0, ws->height - MIN_SANE_H);
+		double top_gap_frac = ((double) ws->current_gaps.top /
+			((double)ws->current_gaps.top + (double)ws->current_gaps.bottom));
+		ws->current_gaps.top = top_gap_frac * total_gap;
+		ws->current_gaps.bottom = total_gap - ws->current_gaps.top;
+	}
+
+	ws->x += ws->current_gaps.left;
+	ws->y += ws->current_gaps.top;
+	ws->width -= ws->current_gaps.left + ws->current_gaps.right;
+	ws->height -= ws->current_gaps.top + ws->current_gaps.bottom;
+}
+
+void workspace_update_representation(struct sway_workspace *ws) {
+	size_t len = container_build_representation(layout_get_type(ws), ws->tiling, NULL);
+	free(ws->representation);
+	ws->representation = calloc(len + 1, sizeof(char));
+	if (!sway_assert(ws->representation, "Unable to allocate title string")) {
+		return;
+	}
+	container_build_representation(layout_get_type(ws), ws->tiling, ws->representation);
+}
+
+void workspace_get_box(struct sway_workspace *workspace, struct wlr_box *box) {
+	box->x = workspace->x;
+	box->y = workspace->y;
+	box->width = workspace->width;
+	box->height = workspace->height;
+}
+
+static void count_tiling_views(struct sway_container *con, void *data) {
+	if (con->view && !container_is_floating_or_child(con)) {
+		size_t *count = data;
+		*count += 1;
+	}
+}
+
+size_t workspace_num_tiling_views(struct sway_workspace *ws) {
+	size_t count = 0;
+	workspace_for_each_container(ws, count_tiling_views, &count);
+	return count;
+}
+
+static void count_sticky_containers(struct sway_container *con, void *data) {
+	if (container_is_sticky(con)) {
+		size_t *count = data;
+		*count += 1;
+	}
+}
+
+size_t workspace_num_sticky_containers(struct sway_workspace *ws) {
+	size_t count = 0;
+	workspace_for_each_container(ws, count_sticky_containers, &count);
+	return count;
+}
+
+struct wlr_box *workspace_get_output_usable_area(struct sway_workspace *workspace) {
+	if (workspace->split.split == WORKSPACE_SPLIT_NONE) {
+		return &workspace->output->usable_area;
+	} else {
+		return &workspace->split.usable_area;
+	}
+}
+
+void workspace_split(struct sway_workspace *workspace, enum sway_workspace_split split,
+		double fraction, int gap) {
+	if (!workspace || !workspace->output ||
+		!(split == WORKSPACE_SPLIT_HORIZONTAL || split == WORKSPACE_SPLIT_VERTICAL)) {
+		return;
+	}
+	struct sway_output *output = workspace->output;
+	struct sway_workspace *child;
+	if (workspace->split.split == WORKSPACE_SPLIT_NONE) {
+		char *name = workspace_next_name(output->wlr_output->name);
+		child = workspace_create(workspace->output, name);
+	} else {
+		child = workspace->split.sibling;
+	}
+	child->split.sibling = workspace;
+	child->split.fraction = fraction;
+	child->split.gap = gap;
+	workspace->split.sibling = child;
+	workspace->split.fraction = fraction;
+	workspace->split.gap = gap;
+	if (split == WORKSPACE_SPLIT_VERTICAL) {
+		workspace->split.split = WORKSPACE_SPLIT_LEFT;
+		child->split.split = WORKSPACE_SPLIT_RIGHT;
+	} else {
+		workspace->split.split = WORKSPACE_SPLIT_TOP;
+		child->split.split = WORKSPACE_SPLIT_BOTTOM;
+	}
+	child->x = 0;
+	child->y = 0;
+	child->width = 0;
+	child->height = 0;
+	workspace->x = 0;
+	workspace->y = 0;
+	workspace->width = 0;
+	workspace->height = 0;
+	arrange_workspace(workspace);
+	arrange_workspace(child);
+	child->layers.tiling->node.info.output_box = &child->split.output_area;
+	workspace->layers.tiling->node.info.output_box = &workspace->split.output_area;
+	output_damage_whole(output);
+	node_set_dirty(&workspace->node);
+	node_set_dirty(&child->node);
+}
+
+void workspace_split_reset(struct sway_workspace *workspace) {
+	if (workspace->split.split == WORKSPACE_SPLIT_NONE) {
+		return;
+	}
+	workspace->split.split = WORKSPACE_SPLIT_NONE;
+	workspace->layers.tiling->node.info.output_box = NULL;
+	struct sway_workspace *sibling = workspace->split.sibling;
+	sibling->split.split = WORKSPACE_SPLIT_NONE;
+	sibling->layers.tiling->node.info.output_box = NULL;
+	arrange_workspace(workspace);
+	arrange_workspace(sibling);
+	node_set_dirty(&workspace->node);
+	node_set_dirty(&sibling->node);
+}
+
+void workspace_swap(struct sway_workspace *first, struct sway_workspace *second,
+		bool name_only) {
+	char *name = first->name;
+	first->name = second->name;
+	second->name = name;
+	if (name_only) {
+		output_sort_workspaces(first->output);
+		if (second->output != first->output) {
+			output_sort_workspaces(second->output);
+		}
+		ipc_event_workspace(NULL, first, "rename");
+		ipc_event_workspace(NULL, second, "rename");
+		return;
+	}
+	if (first->output != second->output) {
+		struct sway_output *first_output = first->output;
+		struct sway_output *second_output = second->output;
+		workspace_detach(first);
+		workspace_detach(second);
+		output_add_workspace(first_output, second);
+		output_add_workspace(second_output, first);
+		output_sort_workspaces(first_output);
+	}
+	output_sort_workspaces(second->output);
+
+	struct sway_workspace *first_sibling = first->split.split == WORKSPACE_SPLIT_NONE ?
+		NULL : first->split.sibling;
+	struct sway_workspace *second_sibling = second->split.split == WORKSPACE_SPLIT_NONE ?
+		NULL : second->split.sibling;
+
+	// Swap split structures and fix them. If the workspaces are not split, no harm done
+	struct sway_workspace_split_data data = first->split;
+	first->split = second->split;
+	second->split = data;
+	// Fix siblings
+	if (first_sibling) {
+		if (first_sibling == second) {
+			first->split.sibling = second;
+		} else {
+			first_sibling->split.sibling = second;
+		}
+	}
+	if (second_sibling) {
+		if (second_sibling == first) {
+			second->split.sibling = first;
+		} else {
+			second_sibling->split.sibling = first;
+		}
+	}
+
+	// Update scene node info for split/non-split workspaces
+	first->layers.tiling->node.info.output_box = first->split.split == WORKSPACE_SPLIT_NONE ?
+		NULL : &first->split.output_area;
+	second->layers.tiling->node.info.output_box = second->split.split == WORKSPACE_SPLIT_NONE ?
+		NULL : &second->split.output_area;
+
+	arrange_workspace(first);
+	arrange_workspace(second);
+	node_set_dirty(&first->node);
+	node_set_dirty(&second->node);
+	workspace_switch(second);
+	if (first->output) {
+		output_damage_whole(first->output);
+	}
+	if (second->output && second->output != first->output) {
+		output_damage_whole(second->output);
+	}
+	ipc_event_workspace(NULL, first, "move");
+	ipc_event_workspace(NULL, second, "move");
+}
