@@ -49,15 +49,15 @@ export TU_DEBUG=noconform
 
 Proot:
 ```
-export XDG_RUNTIME_DIR=/tmp/runtime-$UID /
-mkdir -p "$XDG_RUNTIME_DIR" /
-chmod 700 "$XDG_RUNTIME_DIR" /
-export WLR_RENDERER=vulkan /
-export WLR_NO_HARDWARE_CURSORS=1 /
-export MESA_LOADER_DRIVER_OVERRIDE=kgsl /
-export TU_DEBUG=noconform /
-export WLR_BACKENDS=x11 /
-export DISPLAY=:0 /
+export XDG_RUNTIME_DIR=/tmp/runtime-$UID
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+export WLR_RENDERER=vulkan
+export WLR_NO_HARDWARE_CURSORS=1
+export MESA_LOADER_DRIVER_OVERRIDE=kgsl
+export TU_DEBUG=noconform
+export WLR_BACKENDS=x11
+export DISPLAY=:0
 termux-x11 :0 &
 ```
 
