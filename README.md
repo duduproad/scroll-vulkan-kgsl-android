@@ -12,18 +12,24 @@ If you have root, chroot-distro on termux or Droidspaces.
 Select Debian or Arch on the platform yolu have chosen. (beacuse I only tried them)
 
 # Arch:
-`sudo pacman -S archlinuxarm-keyring bash clang cmake fakeroot fastfetch gcc git gzip kitty lua meson ninja pacman pkgconf quickshell sed sudo sway swaybg unzip vulkan-swrast vulkan-tools wget xorg-xwayland wayvnc vulkan-devel`
+```
+sudo pacman -S archlinuxarm-keyring bash clang cmake fakeroot fastfetch gcc git gzip kitty lua meson ninja pacman pkgconf quickshell sed sudo sway swaybg unzip vulkan-swrast vulkan-tools wget xorg-xwayland wayvnc vulkan-devel
+```
 
 # Debian:
-`sudo apt install clang cmake fakeroot fastfetch gcc git glslang-tools gzip hwdata kitty libcairo2-dev libdisplay-info-dev libdrm-dev libegl-dev libevdev-dev libgbm-dev libgdk-pixbuf-xlib-2.0-dev libgles-dev libgles2 libglvnd-dev libinput-dev libjson-c-dev liblcms2-dev libliftoff-dev liblua5.4-dev libpango1.0-dev libpcre2-dev libpixman-1-dev libseat-dev libudev-dev libvulkan-dev libwayland-dev libx11-xcb-dev libxcb-composite0-dev libxcb-cursor-dev libxcb-damage0-dev libxcb-dpms0-dev libxcb-dri2-0-dev libxcb-dri3-dev libxcb-errors-dev libxcb-ewmh-dev libxcb-glx0-dev libxcb-icccm4-dev libxcb-image0-dev libxcb-keysyms1-dev libxcb-present-dev libxcb-randr0-dev libxcb-record0-dev libxcb-render0-dev libxcb-res0-dev libxcb-screensaver0-dev libxcb-shape0-dev libxcb-shm0-dev libxcb-sync-dev libxcb-util-dev libxcb-xf86dri0-dev libxcb-xfixes0-dev libxcb-xinerama0-dev libxcb-xinput-dev libxcb-xkb-dev libxcb-xrm-dev libxcb-xtest0-dev libxcb1-dev libxkbcommon-dev lua5.4 lua5.5 meson nano ninja-build pkg-config pkgconf scdoc sed spirv-tools sudo sway swaybg unzip vim vulkan-tools wayland-protocols wayvnc wget xcb-proto xwayland`
+```
+sudo apt install clang cmake fakeroot fastfetch gcc git glslang-tools gzip hwdata kitty libcairo2-dev libdisplay-info-dev libdrm-dev libegl-dev libevdev-dev libgbm-dev libgdk-pixbuf-xlib-2.0-dev libgles-dev libgles2 libglvnd-dev libinput-dev libjson-c-dev liblcms2-dev libliftoff-dev liblua5.4-dev libpango1.0-dev libpcre2-dev libpixman-1-dev libseat-dev libudev-dev libvulkan-dev libwayland-dev libx11-xcb-dev libxcb-composite0-dev libxcb-cursor-dev libxcb-damage0-dev libxcb-dpms0-dev libxcb-dri2-0-dev libxcb-dri3-dev libxcb-errors-dev libxcb-ewmh-dev libxcb-glx0-dev libxcb-icccm4-dev libxcb-image0-dev libxcb-keysyms1-dev libxcb-present-dev libxcb-randr0-dev libxcb-record0-dev libxcb-render0-dev libxcb-res0-dev libxcb-screensaver0-dev libxcb-shape0-dev libxcb-shm0-dev libxcb-sync-dev libxcb-util-dev libxcb-xf86dri0-dev libxcb-xfixes0-dev libxcb-xinerama0-dev libxcb-xinput-dev libxcb-xkb-dev libxcb-xrm-dev libxcb-xtest0-dev libxcb1-dev libxkbcommon-dev lua5.4 lua5.5 meson nano ninja-build pkg-config pkgconf scdoc sed spirv-tools sudo sway swaybg unzip vim vulkan-tools wayland-protocols wayvnc wget xcb-proto xwayland
+```
 
 *I know, it's a lot for debian...*
 
 ### Then clone the project:
-`git clone https://github.com/duduproad/scroll-vulkan-kgsl-android.git`
+```
+git clone https://github.com/duduproad/scroll-vulkan-kgsl-android.git
+```
 
 ### Enter the cloned directory and compile it:
-```bash
+```
 cd scroll-vulkan-kgsl-android
 meson setup build
 ninja -C build
@@ -45,6 +51,7 @@ export WLR_RENDERER=vulkan
 export WLR_NO_HARDWARE_CURSORS=1
 export MESA_LOADER_DRIVER_OVERRIDE=kgsl
 export TU_DEBUG=noconform
+export WAYLAND_DISPLAY=wayland-1
 ```
 
 Proot:
@@ -71,7 +78,9 @@ wayvnc 127.0.0.1 5900 &
 ```
 
 Proot:
-`dbus-run-session scroll &`
+```
+dbus-run-session scroll &
+```
 
 
 # scroll
