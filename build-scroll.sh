@@ -79,7 +79,7 @@ sudo pacman -U --noconfirm ./*pkg.tar.xz 2>%1 | tail -3
 
 cd ..
 
-cat <<EOF > start-scroll-vnc.sh 
+cat <<'EOF' > start-scroll-vnc.sh 
 #!/bin/bash
 echo "[*] Creating XDG_RUNTIME_DIR and setting it's permissions..."
 echo "" 
@@ -102,7 +102,7 @@ wayvnc 127.0.0.1 5900 > /dev/null 2>&1 &
 echo "Done!"
 EOF
 
-cat <<EOF > start-scroll-x11.sh
+cat <<'EOF' > start-scroll-x11.sh
 #!/bin/bash
 echo "[*] Creating XDG_RUNTIME_DIR and setting it's permissions..."
 echo ""
