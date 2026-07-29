@@ -9,7 +9,7 @@ If you don't have root, proot-distro on termux.
 
 If you have root, chroot-distro on termux or Droidspaces.
 
-Select Debian or Arch on the platform yolu have chosen. (beacuse I only tried them)
+Select Debian or Arch on the platform you have chosen. (beacuse I only tried them)
 
 # Arch:
 ```
