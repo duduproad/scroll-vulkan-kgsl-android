@@ -12,9 +12,8 @@ If you have root, chroot-distro on termux or Droidspaces.
 Select Debian or Arch on the platform you have chosen. (beacuse I only tried them)
 
 # Arch:
-```
+
 The script installs dependencies. 
-```
 
 # Debian:
 ```
